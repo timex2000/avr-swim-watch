@@ -1,3 +1,15 @@
+SportsWatch 2.0
+
+First design of the swim watch pyscially built.
+
+Physical circuit built on perf-board (it and the circuit diagram included).
+
+User interface has been uploaded to be more useful in the pool.
+
+Code has been cleaned up and the interrupt handlers now do as little as possible and all display updates have been moved to the main loop.
+
+----------------------------------------------------------------------------
+
 SportsWatch 1.0
 	
 Software developed and tested on avr-gcc using avrdude (testing on both Windows 8.1 and Raspberry Pi).
