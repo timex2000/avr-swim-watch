@@ -1,249 +1,173 @@
 /*
 
-SportsWatch 2.0
-28-07-2014
+3.3
+
+Re-wrote the program from scratch using a better FSM for all states and events. THe interrupts are connected to power-off and charging pins, which are used to start the device if it's switched off.	
 
 */
 
-#define F_CPU 16000000UL
+#define F_CPU 8000000UL
 
 #include <avr/io.h>
 #include <util/delay.h>
 #include <avr/interrupt.h>
 #include <stdio.h>
+
+#include <avr/power.h>
+#include <avr/sleep.h>
 	
 #include "u8g.h"
 #include "24c64.h"
+#include "twi.h"
 
-// Structs definitions
-volatile struct buttonsState_t {
-	uint8_t anyPressed;
-	uint8_t upPressed;
-	uint8_t downPressed;
-	uint8_t selectPressed;
-	uint8_t debounceMs;			// ms test for debouncing
-	uint8_t timer0Ints;			// number of times timer0 interrupt has been called
-} buttons;
-
-volatile uint8_t lengths = 255;
-volatile uint16_t lengthTime = 0;
-volatile uint8_t ms100 = 0;					// Stores the amount of 100ms's in the current 1 second count
-volatile uint16_t totalTime = 0;
-volatile uint8_t currentState = 1;
-volatile uint8_t extra10ms = 0;
-
-void chooseNextState(uint8_t);
-
-// Variables for menu (only main menu for now).
+#define NUMBUTTONS 6
 #define MAIN_MENU_ITEMS 2
-char *mainMenuStrings[MAIN_MENU_ITEMS] = {"Last swim", "New Swim"};
+
+#define DS2782EAddress 0b01101000
+
+#define CHARGE PD2
+#define OFF PD3
+#define UP PD0
+#define DOWN PD1
+#define CLK PD5
+#define SELECT PD4
+
+uint8_t charging = 0;
+uint16_t totLenTime = 0;
+uint8_t currentLength = 0;
+uint8_t curLenTime = 0;
+
+struct lengthHistory_t{
+	uint8_t totalLength;
+	uint8_t showLength;
+} history;
+
+typedef enum{
+	STATE_MM1,
+	STATE_OFF,
+	STATE_CHARGING,
+	STATE_MM2,
+	STATE_HISTORY,
+	STATE_SHOWLAP,
+	STATE_RECORD
+} state;
+
+typedef enum{
+	NO_ACTION,
+	SHOW_MM1,
+	SWITCH_OFF,
+	CHARGING,
+	SHOW_MM2,
+	UPDATE_CHARGE,
+	SHOW_HISTORY,
+	SHOW_NEXT_LENGTH,
+	SHOW_PREV_LENGTH,
+	SHOW_RECORD,
+	UPDATE_RECORD,
+	ADD_LENGTH
+} action;
+
+typedef enum{
+	NOTHING,
+	OFF_PRESSED,
+	CHARGER_IN,
+	CHARGER_OUT,
+	DOWN_PRESSED,
+	UP_PRESSED,
+	CLK_PRESSED,
+	SELECT_PRESSED
+} event;
+
+typedef struct{
+	state nextState;
+	action actionToDo;
+} stateElement;
+
+volatile uint8_t pressed[NUMBUTTONS], justPressed[NUMBUTTONS], justReleased[NUMBUTTONS];
 u8g_t u8g;
-volatile uint8_t menu_current = 0;
-volatile uint8_t up = 0;
-volatile uint8_t down = 0;
-volatile uint8_t inMainMenu, inSwimMode, inLastView;
+uint16_t vcc = 0;
 
-volatile uint8_t showLength = 1;
-volatile uint8_t showLenths = 0;
-
-uint8_t currentShowLength = 1;
-uint8_t showLengthAmounts = 0;
-
-uint8_t lastLengthTime = 0;
-volatile uint8_t stateChanged = 0;
-volatile uint8_t updateScreen = 0;
-
-// ------------------------------------ Interrupt inits
-
-// Initialise the Timer counters
-void timerInit(void){ 
-	// Timer1
-	TCCR1A = (1 << WGM12);
-	TCCR1B = (1 << CS11) | (1 << CS10) | (1 << WGM12);				// 64 prescaler
-	TIMSK1 = (1 << OCIE1A);
-	/* 	16MHz / 64 = 250,000MHZ
-		= 0.000004 sec
-		(target time = (timer resolution) * (# timer counts + 1)
-		(# timer counts +1) = (target time) / (timer resolution)
-		= (0.1 s) / (0.000004)				
-		(# timer counts) = 25000 - 1 = 24999 */	
-		// Gives 0.1 sec resolution
-	OCR1A = 24999;
+event getEvent(){
+	event e = NOTHING;
 	
-	// Timer0
-	TCCR0A |= (1 << WGM01);	// CTC mode
-	/*
-		16Mhz / 1024 = 15,625Mhz = 0.000064s = 0.064ms
-		target time = 50ms
-		50 ms / 0.064ms = 781.25
-		0.064ms * 250 = 16ms
-		16ms * 3 = 48ms (which is very close to 50ms for debouncing sake!)
-		
-		16ms / 0.064ms = 250
-		(# timer counts) = 250 - 1 = 249
-	*/
-	TCCR0B |= (1 << CS02) | (1 << CS00);
-	TIMSK0 |= (1 << OCIE0A);					// Timer0 interrupt mask (compare)
-	OCR0A = 249;		
-	TCNT0 = 0;
-	TCCR0B = 0;			// Now now the timer isn't actually needed.
+	if (justPressed[0]){
+		justPressed[0] = 0;
+		e = OFF_PRESSED;
+	}
+	else if (justPressed[1]){
+		justPressed[1] = 0;
+		e = CHARGER_IN;
+	}
+	else if (justReleased[1]){
+		justReleased[1] = 0;
+		e = CHARGER_OUT;
+	}
+	else if (justPressed[2]){
+		justPressed[2] = 0;
+		e = UP_PRESSED;
+	}
+	else if (justPressed[3]){
+		justPressed[3] = 0;
+		e = DOWN_PRESSED;
+	}
+	else if (justPressed[4]){
+		justPressed[4] = 0;
+		e = CLK_PRESSED;
+	}
+	else if (justPressed[5]){
+		justPressed[5] = 0;
+		e = SELECT_PRESSED;
+	}
+	
+	return e;
 }
 
-// Initialising the button press interrupts
-// INT0 = select button, D6 = up, D7 = down
-void initInt(void){
-	PCICR |= (1 << PCIE2);
-	PCMSK2 |= (1 << PD5) | (1 << PD6) | (1 << PD7);
+// RTC 1Hz clk output
+void initTimer(void){
+	TWIStart();
+	TWIWrite(0xA2);
+	TWIWrite(0x0D);
+	TWIWrite(0b10000011);
+	TWIStop();
 }
 
-// ------------------------------------ Other init functions
+// Stops the CLK output
+void stopRTC(void){
+	TWIStart();
+	TWIWrite(0xA2);
+	TWIWrite(0x0D);
+	TWIWrite(0x00);			
+	TWIStop();
+}
 
-// Setting up the OLED display
-void u8g_setup(void){
+void initOLED(void){
 	u8g_InitI2C(&u8g, &u8g_dev_ssd1306_128x64_i2c, U8G_I2C_OPT_NONE);
 }
 
-// ------------------------------------ Interrupt call functions
-
-// Button press interrupt (now including "select"
-// Now working on Timer0 rather than delay.	
-ISR(PCINT2_vect){
-	
-	// First check to see if the timer is waiting for debouncing (i.e. a button has already been pressed).
-	if (buttons.anyPressed || stateChanged){ 				// No good doing a button press in the middle of the screen being updated (as I think this is causing problems with the device crashing).
-			// If button already pressed, do nothing
-	}
-	else{
-			// Debounding note waiting, so actually do something
-		// See what button has been pressed and setup the timer
-		if (!(PIND & (1 << PD5))){
-				buttons.selectPressed = 1;		
-				buttons.anyPressed = 1;
-		}
-		else if (!(PIND & (1 << PD6))){
-				buttons.upPressed = 1;		
-				buttons.anyPressed = 1;
-		}		
-
-		else if (!(PIND & (1 << PD7))){
-				buttons.downPressed = 1;		
-				buttons.anyPressed = 1;
-		}
-		if (buttons.anyPressed){
-			// Only one of the buttons we are interseted in was actually pressed
-			PCICR = 0;			// Cancel the input change interrupt (only want one button pressed at a time)
-			TCNT0 = 0;						// Resetting timer0
-			TCCR0B |= (1 << CS02) | (1 << CS00);	// Setting the prescaler (put to zero when not needed)
-		}
-	}
+void initTimer1(void){
+	TCCR1A = (1 << WGM12);
+	TCCR1B = (1 << CS11) | (1 << CS10) | (1 << WGM12);				// 64 prescaler
+	TIMSK1 = (1 << OCIE1A);
+	/* 8MHZ / 64 = 125,000Hz = 0.000008 sec
+		(15ms) / (0.000008) = 1875
+		(# timer counts) = 1875 - 1 = 1874 */
+	OCR1A = 1874;
 }
 
-// Timer1 compare interrupt
-ISR (TIMER1_COMPA_vect){
-	if (lengths < 255){
-		// Check is required number of 50ms have pass
-		// 10 x 10ms = 1s
-		if (ms100++ >= 9){  			
-			ms100 = 0;
-			lengthTime++;	
-			chooseNextState(0);		// Zero means nothing pressed (i.e. time)
-			updateScreen = 1;
-			totalTime++;
-		}
-	}
+void initPorts(void){
+	DDRD = 0x00;
+	PORTD = 0xFF;
 }
 
-// Timer0 compare interrupt (debouncing)
-ISR (TIMER0_COMPA_vect){
-	// Has debouncing time passed?
-	if (++buttons.timer0Ints >= 3){
-		// Yes it has
-		// Is the button still being pressed down?
-		if (buttons.selectPressed && !(PIND & (1 << PD5))){
-			TCCR0B = 0;
-			TCNT0 = 0;
-			PCICR |= (1 << PCIE2);
-			chooseNextState(3);
-		}
-		else if (buttons.upPressed && !(PIND & (1 << PD6))){
-			TCCR0B = 0;
-			TCNT0 = 0;
-			PCICR |= (1 << PCIE2);
-			chooseNextState(1);
-		}
-		else if (buttons.downPressed && !(PIND & (1 << PD7))){
-			TCCR0B = 0;
-			TCNT0 = 0;
-			PCICR |= (1 << PCIE2);
-			chooseNextState(2);
-		}
-		else {
-			// Button not actually pressed, 
-			TCCR0B = 0;
-			TCNT0 = 0;
-			PCICR |= (1 << PCIE2);
-		}
-		// Resetting the buttons struct
-			buttons.upPressed = 0;
-			buttons.downPressed = 0;
-			buttons.selectPressed = 0;
-			buttons.debounceMs = 50;
-			buttons.timer0Ints = 0;
-			buttons.anyPressed = 0;
-		//stateChanged = 1;
-	}
+void initSystem(void){
+	initPorts();
+	initOLED();	
+	initTimer1();
+	sei();
 }
-
-// ------------------------------------ OLED drawing functions
-
-// Draws the main menu on the display (with the current selection being highlighted)
-// Is there a way to optimise this?
-void drawMainMenu(void){
-	uint8_t i, h;
-	u8g_uint_t w, d;
-	u8g_SetFont(&u8g, u8g_font_6x13);
-	u8g_SetFontRefHeightText(&u8g);
-	u8g_SetFontPosTop(&u8g);
-	h = u8g_GetFontAscent(&u8g) - u8g_GetFontDescent(&u8g);
-	w = u8g_GetWidth(&u8g);
-
-	// Doing the actual drawing
-	u8g_FirstPage(&u8g);
-	do{
-		
-		for (i = 0; i < MAIN_MENU_ITEMS; i++){
-			d = (w - u8g_GetStrWidth(&u8g, mainMenuStrings[i])) / 2;
-			u8g_SetDefaultForegroundColor(&u8g);
-			if (i == menu_current){
-				u8g_DrawBox(&u8g, 0, i*h+1, w, h);
-				u8g_SetDefaultBackgroundColor(&u8g);
-			}
-			u8g_DrawStr(&u8g, d, i*h, mainMenuStrings[i]);
-		}
-		u8g_SetDefaultForegroundColor(&u8g);
-		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
-	} while (u8g_NextPage(&u8g));
-}
-
-// Updates the menu if up or down button are called
-void updateMainMenu(uint8_t up_down){
-	// 1 = up, 0 = down
-	if (up_down == 1){
-		menu_current++;
-		if (menu_current >= MAIN_MENU_ITEMS)
-		menu_current = 0;
-	}
-	else if (up_down == 0){
-		if (menu_current == 0)
-		menu_current = MAIN_MENU_ITEMS;
-		menu_current--;
-	}
-}
-
-// ------------------------------------ Functions required for states
 
 // Converts time into string to be printed in format hh:mm:ss
-char* timeToString(uint16_t time, char *rS){
+void timeToString(uint16_t time, char *rS){
 	//char rS[9];
 
 	// Calculating the required values
@@ -296,57 +220,318 @@ char* timeToString(uint16_t time, char *rS){
 		rS[7] = strSecs[1];
 	}
 	rS[8] = 0x00;
+}
+
+// Gets the current percentage of the battery
+void getBatteryPercentage(void){
+	TWIStart();
+	TWIWrite(DS2782EAddress);
+			// Average current
+	TWIWrite(0x10);				// Current accumulation
 	
-	return rS;
+	TWIStart();
+	//Check status
+	
+	TWIWrite(DS2782EAddress|0b00000001);
+
+	vcc = TWIReadACK() << 8;//}
+	vcc += TWIReadNACK();
+	
+	vcc = vcc*(0.3125);	// 6.25uVh/Rsns = 6.25u/20mOhm = 0.0003125Ah = 0.3125mAh = 1/3.2 = 312uA
+	
+	vcc = (vcc * 100) / 300;		// Converting to % (assumming 373mAh = 100% from experiment
+
+	TWIStop();
 }
 
-void showNextLength(void){
-	if (currentShowLength++ >= showLengthAmounts)
-	currentShowLength = 1;
+char* my_itoa(uint16_t value, char *string, int radix) 
+{ 
+   if(!string) 
+   { 
+      return NULL; 
+   } 
+
+   if(0 != value) 
+   { 
+      char scratch[34]; 
+      int neg; 
+      int offset; 
+      int c; 
+      unsigned int accum; 
+
+      offset =32; 
+      scratch[33] = '\0'; 
+
+      if(radix == 10 && value < 0) 
+      { 
+         neg = 1; 
+         accum = -value; 
+      } 
+      else 
+      { 
+         neg = 0; 
+         accum = (unsigned int)value; 
+      } 
+
+      while(accum) 
+      { 
+         c = accum % radix; 
+         if(c < 10) 
+         { 
+            c += '0'; 
+         } 
+         else 
+         { 
+            c += 'A' - 10; 
+         } 
+         scratch[offset] = c; 
+         accum /= radix; 
+         offset--; 
+      } 
+       
+      if(neg) 
+      { 
+         scratch[offset] = '-'; 
+      } 
+      else 
+      { 
+         offset++; 
+      } 
+
+      strcpy(string,&scratch[offset]); 
+   } 
+   else 
+   { 
+      string[0] = '0'; 
+      string[1] = '\0'; 
+   } 
+
+   return string;
 }
 
-void showPreviousLength(void){
-	if (currentShowLength-- == 1)
-	currentShowLength = showLengthAmounts;
+void drawMainMenu(uint8_t menuPosition){
+	char *mainMenuStrings[MAIN_MENU_ITEMS] = {"Last swim", "New Swim"};
+	uint8_t i, h;
+	u8g_uint_t w, d;
+	u8g_SetFont(&u8g, u8g_font_6x13);
+	u8g_SetFontRefHeightText(&u8g);
+	u8g_SetFontPosTop(&u8g);
+	h = u8g_GetFontAscent(&u8g) - u8g_GetFontDescent(&u8g);
+	w = u8g_GetWidth(&u8g);
+	
+	char vccChar[10];
+	my_itoa(vcc, vccChar, 10);
+
+	// Doing the actual drawing
+	u8g_FirstPage(&u8g);
+	do{
+		
+		for (i = 0; i < MAIN_MENU_ITEMS; i++){
+			d = (w - u8g_GetStrWidth(&u8g, mainMenuStrings[i])) / 2;
+			u8g_SetDefaultForegroundColor(&u8g);
+			if (i == menuPosition){
+				u8g_DrawBox(&u8g, 0, i*h+1, w, h);
+				u8g_SetDefaultBackgroundColor(&u8g);
+			}
+			u8g_DrawStr(&u8g, d, i*h, mainMenuStrings[i]);
+		}
+		u8g_SetDefaultForegroundColor(&u8g);
+		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
+		
+		u8g_DrawStr(&u8g, 5, 50, vccChar);
+	} while (u8g_NextPage(&u8g));
 }
 
-void addLength(void){
-	lengths++;
-	EEWriteByte(2, lengths);
-	EEWriteByte(2+lengths, lengthTime);	
-	//totalTime += lengthTime;
-	// Adding the extra total time from the 10ms
-	extra10ms += ms100;
-	if (extra10ms >= 10){
-		totalTime += 1;
-		extra10ms -= 10;		
+void showMM1(void){
+	drawMainMenu(0);
+}
+
+void showMM2(void){
+	drawMainMenu(1);
+}
+
+// Checking the inputs for button presses and performing the debouncing
+void checkSwitches(void){
+	static uint8_t previousState[NUMBUTTONS];
+	static uint8_t currentState[NUMBUTTONS];
+	static uint16_t lastTime;
+	uint8_t index;
+	uint8_t input = PIND;
+	uint8_t inputCheck[] = {OFF, CHARGE, UP, DOWN, CLK, SELECT};
+	
+	if (lastTime++ < 4){ // 15ms * 4 debouncing time
+		return;
 	}
-	lastLengthTime = lengthTime;
-	lengthTime = 0;
-}
-
-// ------------------------------------ FSM State Functions
-
-// First option of main menu
-void mainMenuOne(void){
-	drawMainMenu();  
-}
-		
-// Second option of main menu
-void mainMenuTwo(void){
-	drawMainMenu();
-}
-
-// State for showing the current swim session
-// Display shows the number of lengths, the last length time, and the total time (from the last length being recorded).
-void recordSwim(void){
-		
-	char str1[4];
-	// Not sure if itoa is the best way to do this
-	itoa(lengths, str1, 10);
-	char rS[9];
 	
+	lastTime = 0;
+	for (index = 0; index < NUMBUTTONS; index++){		
+		if (!(input & (1 << inputCheck[index])))
+			currentState[index] = 0;
+		else
+			currentState[index] = 1;
+		
+		if (currentState[index] == previousState[index]) {
+			if ((pressed[index] == 0) && (currentState[index] == 0)) {
+			// just pressed
+			justPressed[index] = 1;
+			}
+			else if ((pressed[index] == 1) && (currentState[index] == 1)) {
+				// just released
+				justReleased[index] = 1;
+			}
+			pressed[index] = !currentState[index];  // remember, digital HIGH means NOT pressed
+		}
+		previousState[index] = currentState[index];   // keep a running tally of the buttons
+	}	
+}
+
+
+// Used to check for button presses and releases
+ISR (TIMER1_COMPA_vect){
+	checkSwitches();
+}
+
+// Used to wake up the device
+ISR(INT1_vect){
+}
+
+// Used for the charging interrupt
+ISR(INT0_vect){
+}
+
+ 
+
+void showOnScreen(void){
+}
+
+void switchOff(void){
+	//u8g_SleepOn(&u8g);
+	//u8g_SleepOn(&u8g);
+	u8g_FirstPage(&u8g);
+	do {		
+	} while (u8g_NextPage(&u8g));
 	
+	EIMSK = (1 << INT1) | (1 << INT0);
+	EICRA = (1 << ISC11) | (1 << ISC10) | (1 << ISC01) | (1 << ISC00);
+	sei();
+	
+	set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+	sleep_enable();	
+	sleep_mode();
+	//_delay_ms(100);
+
+	sleep_disable();
+	EIMSK = 0x00;		// Detach interrupt after waken up.
+	EICRA = 0x00;
+	//u8g_SleepOff(&u8g);
+	_delay_ms(500);
+}
+
+void showOffScreen(void){
+	char vccChar[10];
+	my_itoa(vcc, vccChar, 10);
+	
+	u8g_FirstPage(&u8g);
+	u8g_SetDefaultForegroundColor(&u8g);
+	do {
+		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
+		
+		// Show the first length
+		u8g_DrawStr(&u8g, (124 - u8g_GetStrWidth(&u8g, "Switching Off"))/2, 10, "Switching Off");
+		u8g_DrawStr(&u8g, 60, 30, vccChar);
+	} while (u8g_NextPage(&u8g));
+}
+
+void showChargingScreen(void){
+	char vccChar[10];
+	my_itoa(vcc, vccChar, 10);
+	
+	u8g_FirstPage(&u8g);
+	u8g_SetDefaultForegroundColor(&u8g);
+	do {
+		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
+		
+		// Show the first length
+		u8g_DrawStr(&u8g, (124 - u8g_GetStrWidth(&u8g, "Charging"))/2, 5, "Charging");
+		u8g_DrawStr(&u8g, 60, 20, vccChar);
+	} while (u8g_NextPage(&u8g));
+}
+
+void showHistoryTotal(void){
+	EEOpen();
+	
+	uint8_t lengths = EEReadByte(2);
+	history.totalLength = lengths;
+	history.showLength = 255;
+	// This will be wrong till I update the record length
+	uint16_t totalTime = EEReadByte(3) << 8;
+	totalTime += EEReadByte(4);
+	
+	// Creating the times for the history display
+	char lengthStr[4], totalTimeStr[10];	
+	itoa(lengths, lengthStr, 10);
+	timeToString(totalTime, totalTimeStr);
+	
+	u8g_FirstPage(&u8g);
+	u8g_SetDefaultForegroundColor(&u8g);
+	do {
+		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
+		u8g_DrawLine(&u8g, 64, 0, 64, 64);
+		
+		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, "Lengths"))/2, 5, "Lengths");
+		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, lengthStr))/2, 5+20, lengthStr);
+		
+		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, "Time"))/2, 5, "Time");
+		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, totalTimeStr))/2, 5+20, totalTimeStr);
+		
+	} while (u8g_NextPage(&u8g));
+}
+
+void getPreviousLength(){
+	if (history.showLength == 255)
+		history.showLength = 0;
+	else if (history.showLength == 0)
+		history.showLength = history.totalLength-1;
+	else
+		history.showLength--;
+}
+
+void getNextLength(void){
+	if (history.showLength == 255)
+		history.showLength = 0;
+	else if (++history.showLength >= history.totalLength)
+		history.showLength = 0;
+}
+
+void showLength(void){
+	uint8_t curTime = EEReadByte(5+history.showLength);
+	
+	char lengthStr[4], timeStr[9];
+	itoa(history.showLength+1, lengthStr, 10);
+	timeToString(curTime, timeStr);
+	
+	u8g_FirstPage(&u8g);
+	u8g_SetDefaultForegroundColor(&u8g);
+	do {
+		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
+		u8g_DrawLine(&u8g, 64, 0, 64, 64);
+		
+		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, "Length"))/2, 5, "Length");
+		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, lengthStr))/2, 5+20, lengthStr);
+		
+		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, "Time"))/2, 5, "Time");
+		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, timeStr))/2, 5+20, timeStr);
+		
+	} while (u8g_NextPage(&u8g));
+}
+
+// Showing the record screen
+void showRecordScreen(void){
+	char lengthStr[4], totLenTimeStr[9], curLenTimeStr[9];
+	itoa(currentLength, lengthStr, 10);
+	timeToString(totLenTime, totLenTimeStr);
+	timeToString(curLenTime, curLenTimeStr);
+
 	u8g_FirstPage(&u8g);
 	u8g_SetDefaultForegroundColor(&u8g);
 	u8g_SetFont(&u8g, u8g_font_6x13);
@@ -357,213 +542,124 @@ void recordSwim(void){
 		
 		// Draw text
 		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
-		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, "Length"))/2, 5, "Length");
-		//u8g_SetFont(&u8g, u8g_font_9x18);
-		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, str1))/2, 32+5, str1);
-		//u8g_SetFont(&u8g, u8g_font_6x13);
+		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, "Length"))/2, 5, "Length");		
+		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, lengthStr))/2, 32+5, lengthStr);
 		
 		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, "Total"))/2, 5, "Total");
-		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, timeToString(totalTime, rS)))/2, 5+15, timeToString(totalTime, rS));
+		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, totLenTimeStr))/2, 5+15, totLenTimeStr);
 		
 		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, "Last len"))/2, 5+32, "Last len");
-		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, timeToString(lastLengthTime, rS)))/2, 5+32+15, timeToString(lastLengthTime, rS));
+		//u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, timeToString(lastLengthTime, rS)))/2, 5+32+15, timeToString(lastLengthTime, rS));
 
 	} while (u8g_NextPage(&u8g));
 }
 
-// State for showing the times for the last recorded swim
-void showHistory(void){
-	// Find current amount of lengths
-	showLengthAmounts = EEReadByte(2);
-	// Display the amount of lengths and the time taken for "currentShowLength"
-	// Find the time for the correct length.
-	uint8_t curTime = EEReadByte(2+currentShowLength);
+void recordCurrentLength(void){
 	
-	// Now do the display
-	char str1[4], str3[4], rS[9];
-	itoa(showLengthAmounts, str1, 10);
-	itoa(currentShowLength, str3, 10);
+	currentLength++;
+	// Now recording to EEPROM
+	EEWriteByte(2, currentLength);
+	EEWriteByte(3, (totLenTime >> 8));
+	EEWriteByte(4, (totLenTime << 8) >> 8);
+	EEWriteByte(4+currentLength, curLenTime);
 	
-	
-	u8g_FirstPage(&u8g);
-	u8g_SetDefaultForegroundColor(&u8g);
-	do {
-		u8g_DrawFrame(&u8g, 0, 0, 128, 64);
-		u8g_DrawLine(&u8g, 64, 0, 64, 64);
-		u8g_DrawLine(&u8g, 64, 32, 128, 32);
-		
-		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, "Lengths"))/2, 5, "Lengths");
-		u8g_DrawStr(&u8g, (64 - u8g_GetStrWidth(&u8g, str1))/2, 5+20, str1);
-		
-		
-		// Show the first length
-		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, "Length"))/2, 5, "Length");
-		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, str3))/2, 5+15, str3);
-		
-		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, "Time"))/2, 32+5, "Time");
-		u8g_DrawStr(&u8g, 64+(64 - u8g_GetStrWidth(&u8g, timeToString(curTime, rS)))/2, 32+5+15, timeToString(curTime, rS));
-	} while (u8g_NextPage(&u8g));
+	curLenTime = 0;
 }
-
-
-
-// Choosing what to do based on current state and event
-void chooseNextState(uint8_t event){
-	/* currentState:
-		1 = main menu 1
-		2 = main menu 2 
-		3 = show history
-		4 = record swim
-	*/
-	
-	stateChanged = 1;
-	switch(currentState){
-	case 1:
-		switch(event){
-		case 1:					// Button 1
-			updateMainMenu(1);
-			//mainMenuTwo();
-			currentState = 2;
-			break;
-		case 2:					// Button 2
-			updateMainMenu(0);
-			//mainMenuTwo();
-			currentState = 2;
-			break;
-		case 3:					// Button 3
-			currentShowLength = 1;	// Show the first length time when we first start showing
-			//showHistory();
-			currentState = 3;
-			break;
-		default:
-			//mainMenuOne();
-			currentState = 1;
-		}
-		break;
-	case 2:
-		switch(event){
-		case 1:
-			updateMainMenu(1);
-			//mainMenuOne();
-			currentState = 1;
-			break;
-		case 2:
-			updateMainMenu(0);
-			//mainMenuOne();
-			currentState = 1;
-			break;
-		case 3:
-			ms100 = 0;
-			lengths = 0;
-			lengthTime = 0;
-			lastLengthTime = 0;
-			totalTime = 0;					
-			//recordSwim();
-			currentState = 4;
-			break;
-		}
-		break;
-		// In show history state
-	case 3:
-		switch(event){
-		case 1:
-			showPreviousLength();
-			//showHistory();
-			currentState = 3;
-			break;
-		case 2:					
-			showNextLength();
-			//showHistory();
-			currentState = 3;
-			break;
-		case 3:
-			up = down = 0;
-			menu_current = 0;
-			//mainMenuOne();
-			currentState = 1;
-			break;
-		}
-		break;
-	case 4:
-		switch(event){
-		case 1:
-			up = down = 0;
-			menu_current = 1;
-			//mainMenuTwo();
-			currentState = 2;
-			break;
-		case 2:
-			up = down = 0;
-			menu_current = 1;
-			//mainMenuTwo();
-			currentState = 2;
-			break;
-		case 3:				
-			addLength();
-			ms100 = 0;
-			//recordSwim();
-			currentState = 4;
-			break;		
-		case 0:				// Time elapsed, so update
-			//recordSwim();
-			currentState = 4;
-			break;
-		}
-		break;
-	}
-}					
 
 int main(void){
-	// Inilialising port B as output for the LCD display
-	DDRB = 0xFF;
-	// Initliasing pin D.2 (INT0) as as input. This will be connected to button.
-	//DDRD |= (1 << PD2);
-	DDRD = 0xFF;
-	// Pull up resistors for input
-	//PORTD |= (1 << PD2);
-	PORTD = 0xFF;
-	// D6 = up
-	// D7 = down
-
-	// Initialising stuff
-	initInt();
-	timerInit();  
-	u8g_setup();
-	EEOpen();  
-	buttons.upPressed = 0;
-	buttons.downPressed = 0;
-	buttons.selectPressed = 0;
-	buttons.debounceMs = 50;
-	buttons.timer0Ints = 0;
-	buttons.anyPressed = 0;
-	sei();
-
-	currentState = 1;
-	chooseNextState(10);
-	stateChanged = 1;
-	updateScreen = 1;
+	state currentState = STATE_MM1;
+	action actionToDo = NO_ACTION;
+	
+	// FSM state/action matrix
+	stateElement stateMatrix[7][8] = {
+		// MM1
+		{{STATE_MM1, NO_ACTION}, {STATE_OFF, SWITCH_OFF}, {STATE_CHARGING, CHARGING}, {STATE_MM1, NO_ACTION}, {STATE_MM2, SHOW_MM2}, {STATE_MM2, SHOW_MM2}, {STATE_MM1, NO_ACTION}, {STATE_HISTORY, SHOW_HISTORY}},
+		
+		// OFF
+		{{STATE_MM1, SHOW_MM1}, {STATE_OFF, NO_ACTION}, {STATE_OFF, NO_ACTION}, {STATE_OFF, NO_ACTION}, {STATE_OFF, NO_ACTION}, {STATE_OFF, NO_ACTION}, {STATE_OFF, NO_ACTION}, {STATE_OFF, NO_ACTION}},
+		
+		// CHARING
+		{{STATE_CHARGING, NO_ACTION}, {STATE_CHARGING, NO_ACTION}, {STATE_CHARGING, NO_ACTION}, {STATE_MM1, SHOW_MM1}, {STATE_CHARGING, NO_ACTION}, {STATE_CHARGING, NO_ACTION}, {STATE_CHARGING, UPDATE_CHARGE}, {STATE_CHARGING, NO_ACTION}},
+		
+		// MM2
+		{{STATE_MM2, NO_ACTION}, {STATE_OFF, SWITCH_OFF}, {STATE_CHARGING, CHARGING}, {STATE_MM2, NO_ACTION}, {STATE_MM1, SHOW_MM1}, {STATE_MM1, SHOW_MM1}, {STATE_MM2, NO_ACTION}, {STATE_RECORD, SHOW_RECORD}},
+		
+		// HISTORY
+		{{STATE_HISTORY, NO_ACTION}, {STATE_OFF, SWITCH_OFF}, {STATE_CHARGING, CHARGING}, {STATE_HISTORY, NO_ACTION}, {STATE_SHOWLAP, SHOW_NEXT_LENGTH}, {STATE_SHOWLAP, SHOW_PREV_LENGTH}, {STATE_HISTORY, NO_ACTION}, {STATE_MM1, SHOW_MM1}},
+		
+		// SHOWLAP
+		{{STATE_SHOWLAP, NO_ACTION}, {STATE_OFF, SWITCH_OFF}, {STATE_CHARGING, CHARGING}, {STATE_HISTORY, NO_ACTION}, {STATE_SHOWLAP, SHOW_NEXT_LENGTH}, {STATE_SHOWLAP, SHOW_PREV_LENGTH}, {STATE_HISTORY, NO_ACTION}, {STATE_HISTORY, SHOW_HISTORY}},
+		
+		// RECORD
+		{{STATE_RECORD, NO_ACTION}, {STATE_OFF, SWITCH_OFF}, {STATE_CHARGING, CHARGING}, {STATE_RECORD, NO_ACTION}, {STATE_MM1, SHOW_MM1}, {STATE_MM1, SHOW_MM1}, {STATE_RECORD, UPDATE_RECORD}, {STATE_RECORD, ADD_LENGTH}}
+	};
+	
+	initSystem();
+	showMM1();
+	
 	while(1){
-		// Updating the display if necessary
-		if (stateChanged){
-			// Showing the correct display for the current stage
-			switch (currentState){				
-				case 1:				// Main menu one
-					mainMenuOne();
-					break;
-				case 2:
-					mainMenuTwo();
-					break;
-				case 3:
-					showHistory();
-					break;
-				case 4:
-					recordSwim();
-					break;					
-			}
-			stateChanged = 0;
-			updateScreen = 0;
+		event e = getEvent();
+		
+		// Obtain the next action
+		stateElement stateEvaluation = stateMatrix[currentState][e];
+		currentState = stateEvaluation.nextState;
+		actionToDo = stateEvaluation.actionToDo;
+		
+		switch(actionToDo){
+			case NO_ACTION:
+				break;
+			case SHOW_MM1:
+				getBatteryPercentage();
+				showMM1();
+				break;
+			case SWITCH_OFF:
+				getBatteryPercentage();
+				showOffScreen();
+				_delay_ms(2000);
+				switchOff();
+				break;
+			case CHARGING:
+				initTimer();
+				getBatteryPercentage();
+				showChargingScreen();
+				break;
+			case SHOW_MM2:
+				getBatteryPercentage();
+				showMM2();
+				break;
+			case UPDATE_CHARGE:
+				getBatteryPercentage();
+				showChargingScreen();
+				break;
+			case SHOW_HISTORY:
+				showHistoryTotal();
+				break;
+			case SHOW_NEXT_LENGTH:
+				getNextLength();
+				showLength();
+				break;
+			case SHOW_PREV_LENGTH:
+				getPreviousLength();
+				showLength();
+				break;
+			case SHOW_RECORD:
+				initTimer();
+				currentLength = 0;
+				totLenTime = 0;
+				showRecordScreen();
+				break;
+			case UPDATE_RECORD:
+				totLenTime++;
+				curLenTime++;
+				showRecordScreen();
+				break;
+			case ADD_LENGTH:
+				//curLenTime = 0;
+				recordCurrentLength();
+				showRecordScreen();
+				break;
+			default:
+				break;
 		}
-	}		
-
-	return (0);
+	}
 }
