@@ -49,14 +49,14 @@
 # User defined values
 TARGETNAME = main
 MCU:=atmega328p
-F_CPU:=16000000
+F_CPU:=8000000
 WORKDIR:=.
 U8GM2DIR:=./u8glib/src
 
 # Type: "avrdude -c ?" to get a full listing.
-AVRDUDE_PROGRAMMER := linuxspi
+AVRDUDE_PROGRAMMER := avrispmkii
 # com1 = serial port. Use lpt1 to connect to parallel port.
-AVRDUDE_PORT := /dev/spidev0.0
+AVRDUDE_PORT := usb
 
 # Replace standard build tools by avr tools
 CC = avr-gcc
@@ -85,7 +85,7 @@ all: $(TARGETNAME).dis $(TARGETNAME).hex
 
 .PHONY: upload
 upload: $(TARGETNAME).dis $(TARGETNAME).hex
-	avrdude -F -p $(MCU) -P $(AVRDUDE_PORT) -c $(AVRDUDE_PROGRAMMER) -v -v -U flash:w:$(TARGETNAME).hex
+	avrdude -F -p $(MCU) -P $(AVRDUDE_PORT) -c $(AVRDUDE_PROGRAMMER) -v -v -U flash:w:$(TARGETNAME).hex -B 5
 	avr-size $(TARGETNAME).elf
 
 .PHONY: clean
