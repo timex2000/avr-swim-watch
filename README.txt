@@ -1,3 +1,23 @@
+7.0
+
+Split the main.c file into separate files to make future editing a bit easier.
+
+-------------------------------------------------
+
+6.0
+
+04-10-2014
+
+Added the ability to record and view multiple sessions.
+
+The history can be deleted, but currently only in one block, rather than choosing to delete different sessions.
+
+Each session takes up 255 bytes of memory in the EEPROM, with the possibility of (255-9) lengths possible. The other nine are used to store the date, time, total time, and number of lengths. Since I'm using 64K bit EEPROM, this gives a possible memory of 31 sessions.
+
+The menus are still a bit messy, but will look at improving them soon
+
+-------------------------------------------------
+
 5.0
 
 Using function pointers in the FSM model.

@@ -52,6 +52,7 @@ MCU:=atmega328p
 F_CPU:=8000000
 WORKDIR:=.
 U8GM2DIR:=./u8glib/src
+INCLUES:=./library
 
 # Type: "avrdude -c ?" to get a full listing.
 AVRDUDE_PROGRAMMER := avrispmkii
@@ -65,7 +66,6 @@ AR  = @avr-ar
 # Compile all .c files in all directories
 SRC = $(shell ls $(WORKDIR)/*.c 2>/dev/null)
 SRC += $(shell ls $(U8GM2DIR)/*.c 2>/dev/null)
-SRC += main.c
 
 # Flags for the linker and the compiler
 COMMON_FLAGS = -DF_CPU=$(F_CPU) -mmcu=$(MCU) $(DOGDEFS)
@@ -86,7 +86,7 @@ all: $(TARGETNAME).dis $(TARGETNAME).hex
 
 .PHONY: upload
 upload: $(TARGETNAME).dis $(TARGETNAME).hex
-	avrdude -F -p $(MCU) -P $(AVRDUDE_PORT) -c $(AVRDUDE_PROGRAMMER) -v -v -U flash:w:$(TARGETNAME).hex -B 5
+	avrdude -F -p $(MCU) -P $(AVRDUDE_PORT) -c $(AVRDUDE_PROGRAMMER) -v -v -U flash:w:$(TARGETNAME).hex -B 0.5
 	avr-size $(TARGETNAME).elf
 
 .PHONY: clean
